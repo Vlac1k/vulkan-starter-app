@@ -11,7 +11,6 @@ layout(set = 0, binding = 0, std140) uniform SceneData {
     vec4 ambient;
     vec4 dir_direction;
     vec4 dir_color;
-    ivec4 counts;
 } scene;
 
 // Набор дескрипторов 1: данные модели

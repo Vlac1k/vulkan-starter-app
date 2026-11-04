@@ -32,16 +32,8 @@ struct SceneData {
     glm::vec4 ambient;
     glm::vec4 dir_direction;
     glm::vec4 dir_color;
-    glm::ivec4 counts;
 };
-static_assert(sizeof(SceneData) == 144, "SceneData must match the shader (std140)");
-
-// Один точечный источник
-struct PointLightData {
-    glm::vec4 position;
-    glm::vec4 color;
-};
-static_assert(sizeof(PointLightData) == 32, "PointLightData must match the shader (std430)");
+static_assert(sizeof(SceneData) == 128, "SceneData must match the shader (std140)");
 
 // Один прожектор в storage buffer
 struct SpotLightData {
@@ -72,15 +64,6 @@ struct PointLightSettings {
     float intensity = 5.0f;
 };
 
-struct SpotLightSettings {
-    glm::vec3 position{2.0f, 2.0f, 2.0f};
-    glm::vec3 direction{-1.0f, -1.0f, -1.0f};
-    glm::vec3 color{1.0f};
-    float intensity = 15.0f;
-    float inner_degrees = 15.0f;
-    float outer_degrees = 25.0f;
-};
-
 struct Settings {
     // Камера
     glm::vec3 camera_position{0.0f, 0.0f, 4.0f};
@@ -95,9 +78,6 @@ struct Settings {
     float light_intensity = 1.0f;
     glm::vec3 ambient_color{1.0f};
     float ambient_intensity = 0.1f;
-
-    std::vector<PointLightSettings> point_lights{PointLightSettings{}};
-    std::vector<SpotLightSettings> spot_lights{SpotLightSettings{}};
 
     glm::vec3 albedo{0.85f, 0.45f, 0.25f};
     glm::vec3 specular_color{1.0f};
@@ -154,12 +134,6 @@ Settings settings;
 SceneData gpu_scene{};
 ModelData gpu_model{};
 
-std::vector<PointLightData> gpu_point_lights;
-constexpr uint32_t max_point_lights = 128;
-
-std::vector<SpotLightData> gpu_spot_lights;
-constexpr uint32_t max_spot_lights = 128;
-
 double animation_time = 0.0;
 double last_time = -1.0;
 
@@ -176,8 +150,6 @@ Buffer vertex_buffer;
 Buffer index_buffer;
 Buffer scene_buffer;
 Buffer model_buffer;
-Buffer point_light_buffer;
-Buffer spot_light_buffer;
 uint32_t index_count = 0;
 
 // Вспомогательные функции
@@ -312,44 +284,8 @@ VkDescriptorSetLayout createUniformSetLayout() {
     return layout;
 }
 
-VkDescriptorSetLayout createSceneSetLayout() {
-    const VkDescriptorSetLayoutBinding bindings[] = {
-        {
-            .binding = 0,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-        {
-            .binding = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-        {
-            .binding = 2,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-    };
-
-    const VkDescriptorSetLayoutCreateInfo info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 3,
-        .pBindings = bindings,
-    };
-
-    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    if (vkCreateDescriptorSetLayout(context.device, &info, nullptr, &layout) != VK_SUCCESS) {
-        std::cerr << "Failed to create scene descriptor set layout\n";
-        return VK_NULL_HANDLE;
-    }
-    return layout;
-}
-
 bool createDescriptors() {
-    scene_set_layout = createSceneSetLayout();
+    scene_set_layout = createUniformSetLayout();
     model_set_layout = createUniformSetLayout();
     if (scene_set_layout == VK_NULL_HANDLE || model_set_layout == VK_NULL_HANDLE) {
         return false;
@@ -400,18 +336,6 @@ bool createDescriptors() {
         .range = sizeof(ModelData),
     };
 
-    const VkDescriptorBufferInfo point_info = {
-        .buffer = point_light_buffer.handle,
-        .offset = 0,
-        .range = VK_WHOLE_SIZE,
-    };
-
-    const VkDescriptorBufferInfo spot_info = {
-        .buffer = spot_light_buffer.handle,
-        .offset = 0,
-        .range = VK_WHOLE_SIZE,
-    };
-
     const VkWriteDescriptorSet writes[] = {
         {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -429,24 +353,8 @@ bool createDescriptors() {
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .pBufferInfo = &model_info,
         },
-        {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = scene_set,
-            .dstBinding = 1,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &point_info,
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = scene_set,
-            .dstBinding = 2,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &spot_info,
-        },
     };
-    vkUpdateDescriptorSets(context.device, 4, writes, 0, nullptr);
+    vkUpdateDescriptorSets(context.device, 2, writes, 0, nullptr);
 
     return true;
 }
@@ -607,7 +515,6 @@ bool createPipeline() {
 } // namespace
 
 // Функции приложения, которые вызывает main
-
 bool initialize() {
     // Геометрия: 4 треугольника + 4 шестиугольника
     std::vector<Vertex> vertices;
@@ -638,16 +545,6 @@ bool initialize() {
         return false;
     }
 
-    const std::vector<PointLightData> empty_lights(max_point_lights);
-    if (!createBuffer(empty_lights.data(), empty_lights.size() * sizeof(PointLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, point_light_buffer)) {
-        return false;
-    }
-
-    const std::vector<SpotLightData> empty_spots(max_spot_lights);
-    if (!createBuffer(empty_spots.data(), empty_spots.size() * sizeof(SpotLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spot_light_buffer)) {
-        return false;
-    }
-
     return createDescriptors() && createPipeline();
 }
 
@@ -661,8 +558,6 @@ void shutdown() {
     vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
     vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
 
-    destroyBuffer(spot_light_buffer);
-    destroyBuffer(point_light_buffer);
     destroyBuffer(model_buffer);
     destroyBuffer(scene_buffer);
     destroyBuffer(index_buffer);
@@ -705,61 +600,6 @@ void update(double time) {
         ImGui::SliderFloat("Light intensity", &s.light_intensity, 0.0f, 5.0f);
         ImGui::ColorEdit3("Ambient color", &s.ambient_color.x);
         ImGui::SliderFloat("Ambient intensity", &s.ambient_intensity, 0.0f, 1.0f);
-    }
-
-    if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::Button("Add point light") && s.point_lights.size() < max_point_lights) {
-            s.point_lights.push_back(PointLightSettings{});
-        }
-
-        int remove_index = -1;
-        for (size_t i = 0; i < s.point_lights.size(); ++i) {
-            PointLightSettings& light = s.point_lights[i];
-
-            ImGui::PushID(int(i));
-            ImGui::Separator();
-            ImGui::Text("Point light %d", int(i));
-            ImGui::DragFloat3("Position", &light.position.x, 0.05f);
-            ImGui::ColorEdit3("Color", &light.color.x);
-            ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 50.0f);
-            if (ImGui::Button("Remove")) {
-                remove_index = int(i);
-            }
-            ImGui::PopID();
-        }
-
-        if (remove_index >= 0) {
-            s.point_lights.erase(s.point_lights.begin() + remove_index);
-        }
-    }
-
-    if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::Button("Add spot light") && s.spot_lights.size() < max_spot_lights) {
-            s.spot_lights.push_back(SpotLightSettings{});
-        }
-
-        int remove_index = -1;
-        for (size_t i = 0; i < s.spot_lights.size(); ++i) {
-            SpotLightSettings& light = s.spot_lights[i];
-
-            ImGui::PushID(int(i) + 1000);
-            ImGui::Separator();
-            ImGui::Text("Spot light %d", int(i));
-            ImGui::DragFloat3("Position", &light.position.x, 0.05f);
-            ImGui::SliderFloat3("Direction", &light.direction.x, -1.0f, 1.0f);
-            ImGui::ColorEdit3("Color", &light.color.x);
-            ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 100.0f);
-            ImGui::SliderFloat("Inner angle (deg)", &light.inner_degrees, 0.0f, 89.0f);
-            ImGui::SliderFloat("Outer angle (deg)", &light.outer_degrees, 0.0f, 90.0f);
-            if (ImGui::Button("Remove")) {
-                remove_index = int(i);
-            }
-            ImGui::PopID();
-        }
-
-        if (remove_index >= 0) {
-            s.spot_lights.erase(s.spot_lights.begin() + remove_index);
-        }
     }
 
     if (ImGui::CollapsingHeader("Material", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -847,35 +687,6 @@ void update(double time) {
     gpu_model.albedo = glm::vec4(s.albedo, 1.0f);
     gpu_model.specular = glm::vec4(s.specular_color, s.shininess);
 
-    gpu_point_lights.clear();
-    for (const PointLightSettings& light : s.point_lights) {
-        gpu_point_lights.push_back(PointLightData{
-            glm::vec4(light.position, 1.0f),
-            glm::vec4(light.color, light.intensity),
-        });
-    }
-
-    gpu_spot_lights.clear();
-    for (const SpotLightSettings& light : s.spot_lights) {
-        glm::vec3 direction = light.direction;
-        if (glm::length(direction) < 1e-4f) {
-            direction = glm::vec3(0.0f, -1.0f, 0.0f);
-        } else {
-            direction = glm::normalize(direction);
-        }
-
-        const float outer = glm::radians(light.outer_degrees);
-        const float inner = std::fmin(glm::radians(light.inner_degrees), outer);
-
-        gpu_spot_lights.push_back(SpotLightData{
-            glm::vec4(light.position, 1.0f),
-            glm::vec4(direction, 0.0f),
-            glm::vec4(light.color, light.intensity),
-            glm::vec4(std::cos(inner), std::cos(outer), 0.0f, 0.0f),
-        });
-    }
-
-    gpu_scene.counts = glm::ivec4(int(gpu_point_lights.size()), int(gpu_spot_lights.size()), 0, 0);
 }
 
 void render(const graphics::internal::FrameData& fd) {
@@ -885,14 +696,6 @@ void render(const graphics::internal::FrameData& fd) {
     // Загружаем данные в uniform-буферы
     vmaCopyMemoryToAllocation(context.allocator, &gpu_scene, scene_buffer.allocation, 0, sizeof(SceneData));
     vmaCopyMemoryToAllocation(context.allocator, &gpu_model, model_buffer.allocation, 0, sizeof(ModelData));
-
-    if (!gpu_point_lights.empty()) {
-        vmaCopyMemoryToAllocation(context.allocator, gpu_point_lights.data(), point_light_buffer.allocation, 0, gpu_point_lights.size() * sizeof(PointLightData));
-    }
-
-    if (!gpu_spot_lights.empty()) {
-        vmaCopyMemoryToAllocation(context.allocator, gpu_spot_lights.data(), spot_light_buffer.allocation, 0, gpu_spot_lights.size() * sizeof(SpotLightData));
-    }
 
     vkResetCommandBuffer(cmd, 0);
 
