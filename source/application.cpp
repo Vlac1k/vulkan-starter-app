@@ -12,6 +12,9 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 namespace application {
 
 using graphics::internal::context;
@@ -22,8 +25,9 @@ namespace {
 struct Vertex {
     glm::vec3 position;
     glm::vec3 normal;
+    glm::vec2 uv;
 };
-static_assert(sizeof(Vertex) == 6 * sizeof(float), "Vertex must be tightly packed");
+static_assert(sizeof(Vertex) == 8 * sizeof(float), "Vertex must be tightly packed");
 
 // Данные сцены
 struct SceneData {
@@ -34,15 +38,6 @@ struct SceneData {
     glm::vec4 dir_color;
 };
 static_assert(sizeof(SceneData) == 128, "SceneData must match the shader (std140)");
-
-// Один прожектор в storage buffer
-struct SpotLightData {
-    glm::vec4 position;
-    glm::vec4 direction;
-    glm::vec4 color;
-    glm::vec4 params;
-};
-static_assert(sizeof(SpotLightData) == 64, "SpotLightData must match the shader (std430)");
 
 // Данные модели
 struct ModelData {
@@ -58,17 +53,39 @@ struct Buffer {
     VmaAllocation allocation = nullptr;
 };
 
-struct PointLightSettings {
-    glm::vec3 position{0.0f, 1.5f, 1.5f};
-    glm::vec3 color{1.0f};
-    float intensity = 5.0f;
+// Диапазон индексов одной модели внутри общего индексного буфера
+struct Mesh {
+    uint32_t first_index = 0;
+    uint32_t index_count = 0;
+};
+
+struct PushConstants {
+    uint32_t flags;
+    float time;
+    float emissive_strength;
+    float uv_scale;
+};
+static_assert(sizeof(PushConstants) == 16, "PushConstants must match the shader");
+
+struct DrawItem {
+    Mesh mesh;
+    ModelData data;
+    uint32_t texture = 0;
+    PushConstants push{};
+};
+
+// Текстура
+struct Texture {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
 };
 
 struct Settings {
     // Камера
-    glm::vec3 camera_position{0.0f, 0.0f, 4.0f};
+    glm::vec3 camera_position{0.0f, 1.5f, 5.0f};
     float camera_yaw = 0.0f;
-    float camera_pitch = 0.0f;
+    float camera_pitch = -15.0f;
     float camera_fov = 60.0f;
     int projection = 0;
     float ortho_half_height = 2.3f;
@@ -79,9 +96,15 @@ struct Settings {
     glm::vec3 ambient_color{1.0f};
     float ambient_intensity = 0.1f;
 
-    glm::vec3 albedo{0.85f, 0.45f, 0.25f};
+    glm::vec3 albedo{1.0f, 1.0f, 1.0f};
     glm::vec3 specular_color{1.0f};
     float shininess = 32.0f;
+
+    int tetra_texture = 3;
+    int ground_texture = 0;
+    bool effect_enabled = true;
+    float emissive_strength = 1.0f;
+    float effect_uv_scale = 1.7f;
 
     // Преобразования объекта
     glm::vec3 position{0.0f};
@@ -132,7 +155,7 @@ constexpr int hexagon_faces[4][6] = {
 Settings settings;
 
 SceneData gpu_scene{};
-ModelData gpu_model{};
+std::vector<DrawItem> draw_list;
 
 double animation_time = 0.0;
 double last_time = -1.0;
@@ -141,7 +164,6 @@ VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;
 VkDescriptorSetLayout model_set_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 VkDescriptorSet scene_set = VK_NULL_HANDLE;
-VkDescriptorSet model_set = VK_NULL_HANDLE;
 
 VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
 VkPipeline pipeline = VK_NULL_HANDLE;
@@ -150,7 +172,28 @@ Buffer vertex_buffer;
 Buffer index_buffer;
 Buffer scene_buffer;
 Buffer model_buffer;
-uint32_t index_count = 0;
+
+constexpr uint32_t max_objects = 16;
+constexpr uint32_t floor_tiles = 3;
+VkDeviceSize model_stride = 0;
+
+Mesh tetra_mesh;
+Mesh floor_mesh;
+
+VkCommandPool transfer_pool = VK_NULL_HANDLE;
+
+const char* const texture_paths[] = {
+    "textures/checker.png",
+    "textures/bricks.png",
+    "textures/wood.png",
+    "textures/blotches.png",
+};
+const char* const texture_names[] = { "Checker", "Bricks", "Wood", "Blotches" };
+constexpr uint32_t texture_count = sizeof(texture_paths) / sizeof(texture_paths[0]);
+std::vector<Texture> textures;
+std::vector<VkDescriptorSet> material_sets;
+
+VkSampler albedo_sampler = VK_NULL_HANDLE;
 
 // Вспомогательные функции
 
@@ -228,6 +271,234 @@ void destroyBuffer(Buffer& buffer) {
     }
 }
 
+bool createTransferPool() {
+    const VkCommandPoolCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = context.graphics_queue_index,
+    };
+
+    if (vkCreateCommandPool(context.device, &info, nullptr, &transfer_pool) != VK_SUCCESS) {
+        std::cerr << "Failed to create transfer command pool\n";
+        return false;
+    }
+    return true;
+}
+
+// Начинает запись разового командного буфера
+VkCommandBuffer beginOneTimeCommands() {
+    const VkCommandBufferAllocateInfo allocate_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = transfer_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(context.device, &allocate_info, &cmd);
+
+    const VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+    return cmd;
+}
+
+// Заканчивает запись, отправляет соманды на GPU и ждет их выполнения
+void endOneTimeCommands(VkCommandBuffer cmd) {
+    vkEndCommandBuffer(cmd);
+
+    const VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    vkCreateFence(context.device, &fence_info, nullptr, &fence);
+
+    const VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    vkQueueSubmit(context.graphics_queue, 1, &submit, fence);
+    vkWaitForFences(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    vkDestroyFence(context.device, fence, nullptr);
+    vkFreeCommandBuffers(context.device, transfer_pool, 1, &cmd);
+}
+
+// Буфер в VRAM
+bool createDeviceBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, Buffer& out) {
+    const VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    const VmaAllocationCreateInfo allocation_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+
+    if (vmaCreateBuffer(context.allocator, &buffer_info, &allocation_info, &out.handle, &out.allocation, nullptr) != VK_SUCCESS) {
+        std::cerr << "Failed to create device-local Vulkan buffer\n";
+        return false;
+    }
+
+    Buffer staging;
+    if (!createBuffer(data, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging)) {
+        destroyBuffer(staging);
+        return false;
+    }
+
+    VkCommandBuffer cmd = beginOneTimeCommands();
+    const VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = size };
+    vkCmdCopyBuffer(cmd, staging.handle, out.handle, 1, &region);
+    endOneTimeCommands(cmd);
+
+    destroyBuffer(staging);
+    return true;
+}
+
+// Загружает изображение из файла и создает из него текстуру в VRAM
+bool createTexture(const char* path, Texture& out) {
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* pixels = stbi_load(path, &width, &height, &channels, STBI_rgb_alpha);
+    if (pixels == nullptr) {
+        std::cerr << "Failed to load image " << path << ": " << stbi_failure_reason() << '\n';
+        return false;
+    }
+    const VkDeviceSize size = VkDeviceSize(width) * VkDeviceSize(height) * 4;
+
+    // Изображение в VRAM
+    const VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_SRGB,
+        .extent = { uint32_t(width), uint32_t(height), 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    const VmaAllocationCreateInfo allocation_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+
+    if (vmaCreateImage(context.allocator, &image_info, &allocation_info, &out.image, &out.allocation, nullptr) != VK_SUCCESS) {
+        std::cerr << "Failed to create Vulkan image for " << path << '\n';
+        stbi_image_free(pixels);
+        return false;
+    }
+
+    // Пиксели копируем в staging буфер
+    Buffer staging;
+    const bool staged = createBuffer(pixels, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging);
+    stbi_image_free(pixels);
+    if (!staged) {
+        vmaDestroyImage(context.allocator, out.image, out.allocation);
+        out.image = VK_NULL_HANDLE;
+        out.allocation = nullptr;
+        return false;
+    }
+
+    const VkImageSubresourceRange range = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+
+    VkCommandBuffer cmd = beginOneTimeCommands();
+
+    const VkImageMemoryBarrier to_transfer = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = out.image,
+        .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_transfer);
+
+    const VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { uint32_t(width), uint32_t(height), 1 },
+    };
+    vkCmdCopyBufferToImage(cmd, staging.handle, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    const VkImageMemoryBarrier to_shader = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = out.image,
+        .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_shader);
+
+    endOneTimeCommands(cmd);
+    destroyBuffer(staging);
+
+    const VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = out.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_SRGB,
+        .subresourceRange = range,
+    };
+
+    if (vkCreateImageView(context.device, &view_info, nullptr, &out.view) != VK_SUCCESS) {
+        std::cerr << "Failed to create image view for " << path << '\n';
+        return false;
+    }
+    return true;
+}
+
+// Правила чтения текстуры
+bool createAlbedoSampler() {
+    const VkSamplerCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .anisotropyEnable = VK_FALSE,
+        .maxAnisotropy = 1.0f,
+        .minLod = 0.0f,
+        .maxLod = 0.0f,
+        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+    };
+
+    if (vkCreateSampler(context.device, &info, nullptr, &albedo_sampler) != VK_SUCCESS) {
+        std::cerr << "Failed to create sampler\n";
+        return false;
+    }
+    return true;
+}
+
 // Добавляет одну грань в массивы вершин и индексов
 void addFace(const int* ids, int count, std::vector<Vertex>& vertices, std::vector<uint16_t>& indices) {
     glm::vec3 p[6];
@@ -246,9 +517,15 @@ void addFace(const int* ids, int count, std::vector<Vertex>& vertices, std::vect
         normal = -normal;
     }
 
+    const glm::vec3 axis_u = glm::normalize(p[1] - p[0]);
+    const glm::vec3 axis_v = glm::cross(normal, axis_u);
+    const float uv_scale = 2.0f * glm::length(p[1] - p[0]);
+
     const int base = int(vertices.size());
     for (int i = 0; i < count; ++i) {
-        vertices.push_back(Vertex{p[i], normal});
+        const glm::vec3 offset = p[i] - centroid;
+        const glm::vec2 uv(glm::dot(offset, axis_u) / uv_scale + 0.5f, glm::dot(offset, axis_v) / uv_scale + 0.5f);
+        vertices.push_back(Vertex{p[i], normal, uv});
     }
 
     for (int i = 1; i + 1 < count; ++i) {
@@ -284,23 +561,54 @@ VkDescriptorSetLayout createUniformSetLayout() {
     return layout;
 }
 
+// Набор модели
+VkDescriptorSetLayout createModelSetLayout() {
+    const VkDescriptorSetLayoutBinding bindings[] = {
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+    };
+
+    const VkDescriptorSetLayoutCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2,
+        .pBindings = bindings,
+    };
+
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(context.device, &info, nullptr, &layout) != VK_SUCCESS) {
+        std::cerr << "Failed to create model descriptor set layout\n";
+        return VK_NULL_HANDLE;
+    }
+    return layout;
+}
+
 bool createDescriptors() {
     scene_set_layout = createUniformSetLayout();
-    model_set_layout = createUniformSetLayout();
+    model_set_layout = createModelSetLayout();
     if (scene_set_layout == VK_NULL_HANDLE || model_set_layout == VK_NULL_HANDLE) {
         return false;
     }
 
-    // Пул, из которого выделяются наборы
     const VkDescriptorPoolSize pool_sizes[] = {
-        { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 2 },
-        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 },
+        { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1 },
+        { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = texture_count },
+        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = texture_count },
     };
 
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 2,
-        .poolSizeCount = 2,
+        .maxSets = 1 + texture_count,
+        .poolSizeCount = 3,
         .pPoolSizes = pool_sizes,
     };
 
@@ -309,52 +617,86 @@ bool createDescriptors() {
         return false;
     }
 
-    const VkDescriptorSetLayout layouts[] = { scene_set_layout, model_set_layout };
-    const VkDescriptorSetAllocateInfo allocate_info = {
+    // Набор сцены
+    const VkDescriptorSetAllocateInfo scene_allocate = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptor_pool,
-        .descriptorSetCount = 2,
-        .pSetLayouts = layouts,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &scene_set_layout,
     };
-
-    VkDescriptorSet sets[2] = {};
-    if (vkAllocateDescriptorSets(context.device, &allocate_info, sets) != VK_SUCCESS) {
-        std::cerr << "Failed to allocate descriptor sets\n";
+    if (vkAllocateDescriptorSets(context.device, &scene_allocate, &scene_set) != VK_SUCCESS) {
+        std::cerr << "Failed to allocate scene descriptor set\n";
         return false;
     }
-    scene_set = sets[0];
-    model_set = sets[1];
 
+    // Наборы материалов
+    const std::vector<VkDescriptorSetLayout> material_layouts(texture_count, model_set_layout);
+    material_sets.resize(texture_count);
+
+    const VkDescriptorSetAllocateInfo material_allocate = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptor_pool,
+        .descriptorSetCount = texture_count,
+        .pSetLayouts = material_layouts.data(),
+    };
+    if (vkAllocateDescriptorSets(context.device, &material_allocate, material_sets.data()) != VK_SUCCESS) {
+        std::cerr << "Failed to allocate material descriptor sets\n";
+        return false;
+    }
+
+    // Записываем в наборы реальные ресурсы
     const VkDescriptorBufferInfo scene_info = {
         .buffer = scene_buffer.handle,
         .offset = 0,
         .range = sizeof(SceneData),
     };
+
     const VkDescriptorBufferInfo model_info = {
         .buffer = model_buffer.handle,
         .offset = 0,
         .range = sizeof(ModelData),
     };
 
-    const VkWriteDescriptorSet writes[] = {
-        {
+    std::vector<VkDescriptorImageInfo> image_infos(texture_count);
+    std::vector<VkWriteDescriptorSet> writes;
+    writes.reserve(1 + 2 * size_t(texture_count));
+
+    writes.push_back(VkWriteDescriptorSet{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = scene_set,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo = &scene_info,
+    });
+
+    for (uint32_t i = 0; i < texture_count; ++i) {
+        image_infos[i] = VkDescriptorImageInfo{
+            .sampler = albedo_sampler,
+            .imageView = textures[i].view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+
+        writes.push_back(VkWriteDescriptorSet{
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = scene_set,
+            .dstSet = material_sets[i],
             .dstBinding = 0,
             .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .pBufferInfo = &scene_info,
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = model_set,
-            .dstBinding = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
             .pBufferInfo = &model_info,
-        },
-    };
-    vkUpdateDescriptorSets(context.device, 2, writes, 0, nullptr);
+        });
+
+        writes.push_back(VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = material_sets[i],
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_infos[i],
+        });
+    }
+
+    vkUpdateDescriptorSets(context.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
 
     return true;
 }
@@ -374,10 +716,19 @@ bool createPipeline() {
     }
 
     const VkDescriptorSetLayout set_layouts[] = { scene_set_layout, model_set_layout };
+
+    const VkPushConstantRange push_range = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(PushConstants),
+    };
+
     const VkPipelineLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 2,
         .pSetLayouts = set_layouts,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_range,
     };
 
     if (vkCreatePipelineLayout(context.device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
@@ -420,13 +771,19 @@ bool createPipeline() {
             .format = VK_FORMAT_R32G32B32_SFLOAT,
             .offset = offsetof(Vertex, normal),
         },
+        {
+            .location = 2,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = offsetof(Vertex, uv),
+        },
     };
 
     const VkPipelineVertexInputStateCreateInfo vertex_input = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = 1,
         .pVertexBindingDescriptions = &binding,
-        .vertexAttributeDescriptionCount = 2,
+        .vertexAttributeDescriptionCount = 3,
         .pVertexAttributeDescriptions = attributes,
     };
 
@@ -515,8 +872,12 @@ bool createPipeline() {
 } // namespace
 
 // Функции приложения, которые вызывает main
-bool initialize() {
-    // Геометрия: 4 треугольника + 4 шестиугольника
+static bool initializeResources() {
+    if (!createTransferPool()) {
+        return false;
+    }
+
+    // Геометрия: фигура и пол лежат в общих вершинном и индексном буферах.
     std::vector<Vertex> vertices;
     std::vector<uint16_t> indices;
 
@@ -526,26 +887,66 @@ bool initialize() {
     for (const auto& face : hexagon_faces) {
         addFace(face, 6, vertices, indices);
     }
-    index_count = uint32_t(indices.size());
+    tetra_mesh = Mesh{0, uint32_t(indices.size())};
 
-    if (!createBuffer(vertices.data(), vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer)) {
+    // Пол: квадрат 2x2 в плоскости XZ
+    const uint16_t floor_base = uint16_t(vertices.size());
+    const float tiles = float(floor_tiles);
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
+    vertices.push_back(Vertex{{-1.0f, 0.0f, -1.0f}, up, {0.0f, 0.0f}});
+    vertices.push_back(Vertex{{ 1.0f, 0.0f, -1.0f}, up, {tiles, 0.0f}});
+    vertices.push_back(Vertex{{ 1.0f, 0.0f,  1.0f}, up, {tiles, tiles}});
+    vertices.push_back(Vertex{{-1.0f, 0.0f,  1.0f}, up, {0.0f, tiles}});
+
+    floor_mesh = Mesh{uint32_t(indices.size()), 6};
+    const uint16_t floor_indices[] = {0, 1, 2, 0, 2, 3};
+    for (const uint16_t i : floor_indices) {
+        indices.push_back(uint16_t(floor_base + i));
+    }
+
+    // Вершинный и индексный буферы в VRAM
+    if (!createDeviceBuffer(vertices.data(), vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer)) {
         return false;
     }
 
-    if (!createBuffer(indices.data(), indices.size() * sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer)) {
+    if (!createDeviceBuffer(indices.data(), indices.size() * sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer)) {
         return false;
     }
 
-    // Uniform-буферы создаются один раз, а содержимое обновляется каждый кадр.
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(context.physical_device, &properties);
+    const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+    model_stride = (VkDeviceSize(sizeof(ModelData)) + alignment - 1) / alignment * alignment;
+
+    const std::vector<uint8_t> zeros(size_t(model_stride) * max_objects);
+    if (!createBuffer(zeros.data(), zeros.size(), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, model_buffer)) {
+        return false;
+    }
+
     if (!createBuffer(&gpu_scene, sizeof(SceneData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, scene_buffer)) {
         return false;
     }
 
-    if (!createBuffer(&gpu_model, sizeof(ModelData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, model_buffer)) {
+    textures.resize(texture_count);
+    for (uint32_t i = 0; i < texture_count; i++) {
+        if (!createTexture(texture_paths[i], textures[i])) {
+            return false;
+        }
+    }
+
+    if (!createAlbedoSampler()) {
         return false;
     }
 
     return createDescriptors() && createPipeline();
+}
+
+bool initialize() {
+    if (!initializeResources()) {
+        shutdown();
+        return false;
+    }
+    return true;
 }
 
 void shutdown() {
@@ -557,6 +958,15 @@ void shutdown() {
     vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
     vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
     vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
+
+    vkDestroySampler(context.device, albedo_sampler, nullptr);
+
+    for (Texture& texture : textures) {
+        vkDestroyImageView(context.device, texture.view, nullptr);
+        vmaDestroyImage(context.allocator, texture.image, texture.allocation);
+    }
+
+    vkDestroyCommandPool(context.device, transfer_pool, nullptr);
 
     destroyBuffer(model_buffer);
     destroyBuffer(scene_buffer);
@@ -628,6 +1038,16 @@ void update(double time) {
         ImGui::SliderFloat("Spin (deg/s)", &s.spin_speed, 0.0f, 360.0f);
     }
 
+    if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Combo("Tetrahedron texture", &s.tetra_texture, texture_names, int(texture_count));
+        ImGui::Combo("Ground texture", &s.ground_texture, texture_names, int(texture_count));
+
+        ImGui::Separator();
+        ImGui::Checkbox("Non-trivial sampling (tetrahedron)", &s.effect_enabled);
+        ImGui::SliderFloat("Emissive strength", &s.emissive_strength, 0.0f, 3.0f);
+        ImGui::SliderFloat("Second sample UV scale", &s.effect_uv_scale, 0.5f, 4.0f);
+    }
+
     ImGui::Separator();
     if (ImGui::Button("Reset all")) {
         s = Settings{};
@@ -682,10 +1102,37 @@ void update(double time) {
     gpu_scene.dir_direction = glm::vec4(light_direction, 0.0f);
     gpu_scene.dir_color = glm::vec4(s.light_color, s.light_intensity);
 
-    gpu_model.model = model;
-    gpu_model.normal_matrix = glm::transpose(glm::inverse(model));
-    gpu_model.albedo = glm::vec4(s.albedo, 1.0f);
-    gpu_model.specular = glm::vec4(s.specular_color, s.shininess);
+    draw_list.clear();
+
+    ModelData tetra{};
+    tetra.model = model;
+    tetra.normal_matrix = glm::transpose(glm::inverse(model));
+    tetra.albedo = glm::vec4(s.albedo, 1.0f);
+    tetra.specular = glm::vec4(s.specular_color, s.shininess);
+    
+    DrawItem tetra_item{tetra_mesh, tetra};
+    tetra_item.texture = uint32_t(s.tetra_texture);
+    tetra_item.push = PushConstants{
+        s.effect_enabled ? 1u : 0u,
+        float(time),
+        s.emissive_strength,
+        s.effect_uv_scale,
+    };
+    draw_list.push_back(tetra_item);
+
+    // Пол: квадрат 2x2, растянутый в 6 раз и опущенный под фигуру
+    glm::mat4 ground_model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -1.6f, 0.0f));
+    ground_model = glm::scale(ground_model, glm::vec3(6.0f));
+
+    ModelData ground{};
+    ground.model = ground_model;
+    ground.normal_matrix = glm::transpose(glm::inverse(ground_model));
+    ground.albedo = glm::vec4(1.0f);
+    ground.specular = glm::vec4(0.2f, 0.2f, 0.2f, 16.0f);
+    
+    DrawItem ground_item{floor_mesh, ground};
+    ground_item.texture = uint32_t(s.ground_texture);
+    draw_list.push_back(ground_item);
 
 }
 
@@ -695,7 +1142,11 @@ void render(const graphics::internal::FrameData& fd) {
 
     // Загружаем данные в uniform-буферы
     vmaCopyMemoryToAllocation(context.allocator, &gpu_scene, scene_buffer.allocation, 0, sizeof(SceneData));
-    vmaCopyMemoryToAllocation(context.allocator, &gpu_model, model_buffer.allocation, 0, sizeof(ModelData));
+    
+    // Каждая модель записывается в свою строку динамического uniform buffer.
+    for (size_t i = 0; i < draw_list.size(); ++i) {
+        vmaCopyMemoryToAllocation(context.allocator, &draw_list[i].data, model_buffer.allocation, VkDeviceSize(i) * model_stride, sizeof(ModelData));
+      }
 
     vkResetCommandBuffer(cmd, 0);
 
@@ -734,14 +1185,21 @@ void render(const graphics::internal::FrameData& fd) {
     const VkRect2D scissor = { .offset = {0, 0}, .extent = extent };
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Подключаем оба набора дескрипторов
-    const VkDescriptorSet sets[] = { scene_set, model_set };
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 2, sets, 0, nullptr);
-
     const VkDeviceSize vertex_offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.handle, &vertex_offset);
     vkCmdBindIndexBuffer(cmd, index_buffer.handle, 0, VK_INDEX_TYPE_UINT16);
-    vkCmdDrawIndexed(cmd, index_count, 1, 0, 0, 0);
+
+    for (size_t i = 0; i < draw_list.size(); ++i) {
+        const DrawItem& item = draw_list[i];
+
+        const VkDescriptorSet sets[] = { scene_set, material_sets[item.texture] };
+        const uint32_t dynamic_offset = uint32_t(VkDeviceSize(i) * model_stride);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 2, sets, 1, &dynamic_offset);
+
+        vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &item.push);
+
+        vkCmdDrawIndexed(cmd, item.mesh.index_count, 1, item.mesh.first_index, 0, 0);
+    }
 
     vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);
